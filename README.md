@@ -1,3 +1,7 @@
+This is a fork of the great work done by [Nemuritor01](https://github.com/Nemuritor01/css-swipe-card). This fork add looping the swipe card and support for conditional cards.
+
+Loop work with 3+ cards visible by adding to the parameters loop: true
+
 # CSS-Swipe-Card
 
 ![readme-images-css-swipe-card](https://github.com/Nemuritor01/css-swipe-card/blob/main/.github/css-swipe-card.png)
@@ -86,6 +90,7 @@ Add a card with type `custom:css-swipe-card`:
 | `template` | string | slider-horizontal | slider-horizontal, slider-vertical |
 | `height` | string | | Any css option that fits in the `height` css value | Will force the height of the swiper container |
 | `auto_height` | boolean | false | true, false | force the same heigth, based on the tallest card |
+| `loop` | boolean | false | true, false | loop back to the start or end if you have 3+ cards |
 | `card_gap` | string | 0px | Any css option that fits in the `width` css value | |
 | `timer` | number | 0 | Any number | Will reset the swiper to the first card after `timer` seconds |
 | `pagination` | boolean | false | true, false | enable pagination bullets |

@@ -28,6 +28,7 @@ class CssSwipeCard extends HTMLElement {
       navigation: false,
       navigation_next: '',
       navigation_prev: '',
+      loop: false,
       custom_css: {},
       cardId: this.cardId,
       ...config
@@ -51,6 +52,7 @@ class CssSwipeCard extends HTMLElement {
       slide.classList.add('slide');
       slide.style.width = '100%';
       slide.dataset.index = index;
+      slide.dataset.logicalIndex = index;
       card.classList.add('card-element');
       slide.appendChild(card);
       cardContainer.appendChild(slide);
@@ -65,8 +67,11 @@ class CssSwipeCard extends HTMLElement {
 
     this.applyCustomStyles();
 
-    if (this.config.pagination) {
-      this.setupPagination();
+    // Check if any cards are conditional - if so, delay pagination setup until after cleanup
+    const hasConditionalCards = this.config.cards.some(card => card.type === 'conditional');
+
+    if (this.config.pagination && !hasConditionalCards) {
+      this.setupPagination(); // Only setup now if no conditional cards
     }
 
     if (this.config.navigation) {
@@ -80,10 +85,27 @@ class CssSwipeCard extends HTMLElement {
       this.updateCurrentIndex();
       this.updatePagination();
     });
-    
+
     if (this._hass) {
       this.checkInputNumberState();
     }
+
+    // Remove empty conditional slides after render completes, THEN setup pagination/looping
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        this.removeEmptySlides();
+
+        // Setup pagination if we have conditional cards (was deferred earlier)
+        if (this.config.pagination && hasConditionalCards) {
+          this.setupPagination();
+        }
+
+        // Setup looping AFTER conditional cards are cleaned up
+        if (this.config.loop && this._cards.length >= 3) {
+          this.setupLooping();
+        }
+      }, 300); // Wait longer for conditional cards to fully evaluate
+    });
   }
 
   // HTML and CSS generation methods
@@ -433,12 +455,17 @@ class CssSwipeCard extends HTMLElement {
     const isHorizontal = this.config.template === 'slider-horizontal';
     const scrollPosition = isHorizontal ? slider.scrollLeft : slider.scrollTop;
     const viewportSize = isHorizontal ? slider.clientWidth : slider.clientHeight;
-    
+
+    // Get slides in current DOM order
+    const slides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+
     let accumulatedSize = 0;
-    for (let i = 0; i < this._cards.length; i++) {
-      const cardSize = isHorizontal ? this._cards[i].clientWidth : this._cards[i].clientHeight;
+    for (let i = 0; i < slides.length; i++) {
+      const slide = slides[i];
+      const cardSize = isHorizontal ? slide.offsetWidth : slide.offsetHeight;
       if (scrollPosition < accumulatedSize + cardSize / 2) {
-        this.currentIndex = i;
+        // Use logical index, not DOM position
+        this.currentIndex = parseInt(slide.dataset.logicalIndex);
         break;
       }
       accumulatedSize += cardSize;
@@ -467,6 +494,32 @@ class CssSwipeCard extends HTMLElement {
     const inputNumberEntity = `input_number.${this.config.cardId}`;
     if (oldHass && hass.states[inputNumberEntity] !== oldHass.states[inputNumberEntity]) {
       this.checkInputNumberState();
+    }
+
+    // Check if conditional card entities changed (debounced cleanup)
+    if (oldHass && this.config.cards) {
+      let conditionalEntityChanged = false;
+
+      // Extract entities from conditional cards
+      this.config.cards.forEach(cardConfig => {
+        if (cardConfig.type === 'conditional' && cardConfig.conditions) {
+          cardConfig.conditions.forEach(condition => {
+            const entityId = condition.entity;
+            if (oldHass.states[entityId]?.state !== hass.states[entityId]?.state) {
+              conditionalEntityChanged = true;
+            }
+          });
+        }
+      });
+
+      if (conditionalEntityChanged) {
+        // Debounce re-render to avoid excessive renders
+        clearTimeout(this._conditionalDebounce);
+        this._conditionalDebounce = setTimeout(() => {
+          // Full re-render needed to show/hide cards based on new conditions
+          this.render();
+        }, 100);
+      }
     }
   }
 
@@ -542,11 +595,18 @@ class CssSwipeCard extends HTMLElement {
     // Clear existing pagination bullets
     paginationControl.innerHTML = '';
 
-    this._cards.forEach((_, index) => {
+    // Get visible slides from DOM (after conditional cleanup)
+    const visibleSlides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+
+    // Create bullets only for visible cards
+    visibleSlides.forEach((slide, visibleIndex) => {
+      const logicalIndex = parseInt(slide.dataset.logicalIndex);
       const bullet = document.createElement('button');
       bullet.classList.add('pagination-bullet');
-      bullet.setAttribute('aria-label', `Go to slide ${index + 1}`);
-      bullet.addEventListener('click', () => this.scrollToCard(index));
+      bullet.dataset.logicalIndex = logicalIndex;
+      bullet.dataset.visibleIndex = visibleIndex;
+      bullet.setAttribute('aria-label', `Go to slide ${visibleIndex + 1}`);
+      bullet.addEventListener('click', () => this.scrollToCard(logicalIndex));
       paginationControl.appendChild(bullet);
     });
 
@@ -558,8 +618,10 @@ class CssSwipeCard extends HTMLElement {
     if (!paginationControl) return;
 
     const bullets = paginationControl.querySelectorAll('.pagination-bullet');
-    bullets.forEach((bullet, index) => {
-      if (index === this.currentIndex) {
+    bullets.forEach((bullet) => {
+      // Compare by logical index stored in dataset, not array position
+      const bulletLogicalIndex = parseInt(bullet.dataset.logicalIndex);
+      if (bulletLogicalIndex === this.currentIndex) {
         bullet.classList.add('active');
         bullet.setAttribute('aria-current', 'true');
       } else {
@@ -578,8 +640,34 @@ class CssSwipeCard extends HTMLElement {
   }
 
   navigate(direction) {
-    const newIndex = Math.max(0, Math.min(this.currentIndex + direction, this._cards.length - 1));
-    this.scrollToCard(newIndex);
+    // Get visible slides and their logical indexes
+    const visibleSlides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+    if (visibleSlides.length === 0) return;
+
+    const visibleLogicalIndexes = visibleSlides.map(s => parseInt(s.dataset.logicalIndex));
+
+    // Find current position in the visible list
+    let currentPosition = visibleLogicalIndexes.indexOf(this.currentIndex);
+    if (currentPosition === -1) currentPosition = 0;
+
+    let newPosition;
+
+    if (this.config.loop && visibleSlides.length >= 3) {
+      // Wrap around for loop mode
+      newPosition = currentPosition + direction;
+      if (newPosition >= visibleSlides.length) {
+        newPosition = 0;
+      } else if (newPosition < 0) {
+        newPosition = visibleSlides.length - 1;
+      }
+    } else {
+      // Clamp to boundaries for non-loop mode
+      newPosition = Math.max(0, Math.min(currentPosition + direction, visibleSlides.length - 1));
+    }
+
+    // Get the logical index at the new position
+    const newLogicalIndex = visibleLogicalIndexes[newPosition];
+    this.scrollToCard(newLogicalIndex);
   }
 
   // Card scrolling methods
@@ -588,10 +676,18 @@ class CssSwipeCard extends HTMLElement {
     if (!slider) return;
 
     const isHorizontal = this.config.template === 'slider-horizontal';
-    let scrollPosition = 0;
 
-    for (let i = 0; i < index; i++) {
-      scrollPosition += isHorizontal ? this._cards[i].clientWidth : this._cards[i].clientHeight;
+    // Find the slide with the matching logical index
+    const slides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+    const targetSlide = slides.find(slide => parseInt(slide.dataset.logicalIndex) === index);
+
+    if (!targetSlide) return;
+
+    // Calculate scroll position to the target slide
+    let scrollPosition = 0;
+    for (const slide of slides) {
+      if (slide === targetSlide) break;
+      scrollPosition += isHorizontal ? slide.offsetWidth : slide.offsetHeight;
     }
 
     slider.scrollTo({
@@ -655,10 +751,218 @@ class CssSwipeCard extends HTMLElement {
     }, this.config.timer * 1000);
   }
 
+  // Remove empty slides (from conditional cards that evaluated to hidden)
+  removeEmptySlides() {
+    const slider = this.shadowRoot.querySelector(`.${this.config.template}`);
+    if (!slider) return;
+
+    const slides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+    let removedAny = false;
+
+    slides.forEach((slide, domIndex) => {
+      const card = slide.querySelector('.card-element');
+      const logicalIndex = parseInt(slide.dataset.logicalIndex);
+
+      // Only check cards that are configured as conditional
+      const cardConfig = this.config.cards[logicalIndex];
+      if (!cardConfig || cardConfig.type !== 'conditional') {
+        return; // Skip non-conditional cards
+      }
+
+      // Check multiple ways to detect if conditional card is hidden
+      let isEmpty = false;
+
+      // Method 1: Check for hui-conditional-card element
+      const conditionalElement = card.querySelector('hui-conditional-card');
+      if (conditionalElement) {
+        const computedStyle = window.getComputedStyle(conditionalElement);
+        isEmpty = computedStyle.display === 'none';
+      }
+
+      // Method 2: Check if card has very small height (likely empty)
+      if (!isEmpty && card.offsetHeight < 10) {
+        isEmpty = true;
+      }
+
+      // Method 3: Check if card has no visible children
+      if (!isEmpty && card.children.length === 0) {
+        isEmpty = true;
+      }
+
+      // Method 4: Check shadowRoot of card element for empty content
+      if (!isEmpty && card.shadowRoot) {
+        const cardContent = card.shadowRoot.querySelector('*');
+        if (!cardContent || cardContent.offsetHeight < 10) {
+          isEmpty = true;
+        }
+      }
+
+      if (isEmpty) {
+        slide.remove();
+        removedAny = true;
+      }
+    });
+
+    // Only update if we actually removed slides
+    if (removedAny) {
+      const slider = this.shadowRoot.querySelector(`.${this.config.template}`);
+      const isHorizontal = this.config.template === 'slider-horizontal';
+
+      // Force layout recalculation
+      if (slider) {
+        slider.offsetHeight; // Force reflow
+      }
+
+      // Update _cards array to only include visible cards
+      const visibleSlides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+      this._cards = visibleSlides.map(slide => slide.querySelector('.card-element')).filter(Boolean);
+
+      // Update currentIndex if needed (in case current card was removed)
+      if (this.currentIndex !== undefined) {
+        // Check if current index still exists in visible slides
+        const currentExists = visibleSlides.some(s => parseInt(s.dataset.logicalIndex) === this.currentIndex);
+        if (!currentExists && visibleSlides.length > 0) {
+          // Reset to first visible card
+          this.currentIndex = parseInt(visibleSlides[0].dataset.logicalIndex);
+        }
+      } else if (visibleSlides.length > 0) {
+        // Initialize currentIndex to first visible card
+        this.currentIndex = parseInt(visibleSlides[0].dataset.logicalIndex);
+      }
+
+      // Reset scroll position to start (first visible card)
+      if (slider) {
+        // Disable smooth scrolling for instant position reset
+        const originalBehavior = slider.style.scrollBehavior;
+        slider.style.scrollBehavior = 'auto';
+
+        if (isHorizontal) {
+          slider.scrollLeft = 0;
+        } else {
+          slider.scrollTop = 0;
+        }
+
+        // Force another reflow
+        slider.offsetHeight;
+
+        // Restore smooth scrolling
+        requestAnimationFrame(() => {
+          slider.style.scrollBehavior = originalBehavior;
+        });
+      }
+
+      // Re-setup pagination and looping with updated card count
+      if (this.config.pagination) {
+        this.setupPagination();
+      }
+
+      if (this.config.loop && this._cards.length >= 3) {
+        this.setupLooping();
+      }
+
+      // Update pagination to reflect current state
+      this.updatePagination();
+    }
+  }
+
+  // Looping setup method
+  setupLooping() {
+    // Disconnect old observer if exists
+    if (this.loopObserver) {
+      this.loopObserver.disconnect();
+      this.loopObserver = null;
+    }
+
+    const slider = this.shadowRoot.querySelector(`.${this.config.template}`);
+    const slides = this.shadowRoot.querySelectorAll('.slide');
+
+    if (slides.length < 3) return; // Only enable for 3+ cards
+
+    const isHorizontal = this.config.template === 'slider-horizontal';
+
+    // Listen for scrollend event (native, no delay)
+    const handleScrollEnd = () => {
+      const allSlides = Array.from(this.shadowRoot.querySelectorAll('.slide'));
+      const currentFirst = allSlides[0];
+      const currentLast = allSlides[allSlides.length - 1];
+
+      // Get current scroll position
+      const currentScroll = isHorizontal ? slider.scrollLeft : slider.scrollTop;
+
+      // Calculate which slide is currently snapped/visible
+      let currentSlideIndex = 0;
+      let accumulatedSize = 0;
+      for (let i = 0; i < allSlides.length; i++) {
+        const slideSize = isHorizontal ? allSlides[i].offsetWidth : allSlides[i].offsetHeight;
+        if (currentScroll < accumulatedSize + slideSize / 2) {
+          currentSlideIndex = i;
+          break;
+        }
+        accumulatedSize += slideSize;
+      }
+
+      const currentSlide = allSlides[currentSlideIndex];
+
+      // Disable scroll-behavior temporarily for instant repositioning
+      const originalBehavior = slider.style.scrollBehavior;
+      slider.style.scrollBehavior = 'auto';
+
+      // If snapped to last slide, move first to end
+      if (currentSlide === currentLast) {
+        const firstSlideSize = isHorizontal ? currentFirst.offsetWidth : currentFirst.offsetHeight;
+
+        // Store the target scroll position before DOM manipulation
+        const targetScroll = currentScroll - firstSlideSize;
+
+        slider.appendChild(currentFirst);
+
+        // Force immediate layout recalculation
+        slider.offsetHeight;
+
+        // Compensate scroll position
+        if (isHorizontal) {
+          slider.scrollLeft = targetScroll;
+        } else {
+          slider.scrollTop = targetScroll;
+        }
+      }
+      // If snapped to first slide, move last to beginning
+      else if (currentSlide === currentFirst) {
+        const lastSlideSize = isHorizontal ? currentLast.offsetWidth : currentLast.offsetHeight;
+
+        // Store the target scroll position before DOM manipulation
+        const targetScroll = currentScroll + lastSlideSize;
+
+        slider.prepend(currentLast);
+
+        // Force immediate layout recalculation
+        slider.offsetHeight;
+
+        // Compensate scroll position
+        if (isHorizontal) {
+          slider.scrollLeft = targetScroll;
+        } else {
+          slider.scrollTop = targetScroll;
+        }
+      }
+
+      // Restore smooth scrolling
+      requestAnimationFrame(() => {
+        slider.style.scrollBehavior = originalBehavior;
+      });
+    };
+
+    // Use native scrollend event (no delay, triggers when snap completes)
+    slider.addEventListener('scrollend', handleScrollEnd);
+  }
+
   // Cleanup method
   disconnectedCallback() {
     if (this.resizeObserver) {
       this.resizeObserver.disconnect();
+    }
+    if (this.loopObserver) {
+      this.loopObserver.disconnect();
     }
     if (this.timerInterval) {
       clearInterval(this.timerInterval);
